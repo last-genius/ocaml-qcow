@@ -181,6 +181,7 @@ let stream_make_cluster_map h size_sectors cluster_info metadata () =
   in
   max_cluster := Cluster.add !max_cluster (Cluster.of_int64 gap) ;
 
+  Printf.fprintf stderr "l1_table_start_cluster: %Lu\n" l1_table_start_cluster;
   Log.debug (fun f ->
       f
         "refcount_table_clusters is %d\n\
