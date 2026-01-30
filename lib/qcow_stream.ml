@@ -24,6 +24,8 @@ let ( ++ ) = Int64.add
 
 let ( // ) = Int64.div
 
+let ( ** ) = Int64.mul
+
 let src =
   let src =
     Logs.Src.create "qcow-stream" ~doc:"qcow2 with streaming capabilities"
@@ -198,7 +200,8 @@ let stream_make_cluster_map h size_sectors cluster_info metadata () =
      for cluster Y, its virtual address is at index (Y-X)
      [| X's virtual_address ; X+1's virtual_address ; X+2's virtual_address |]
      *)
-  let data_refs = ref (Array.make (Int64.to_int data_clusters_num) (-1L)) in
+  let physical_clusters_approx = (5L ** Cluster.to_int64 !max_cluster) // 4L in
+  let data_refs = Qcow_mapping.create physical_clusters_approx in
 
   let parse x =
     if x = Physical.unmapped then
@@ -243,12 +246,10 @@ let stream_make_cluster_map h size_sectors cluster_info metadata () =
         max_cluster := Cluster.(add !max_cluster (of_int64 1L))
     ) ;
 
-    let array_length = Array.length !data_refs in
-    if Cluster.to_int !max_cluster > array_length then (
-      Printf.fprintf stderr "resizing from %d\n" array_length ;
-      let arr = Array.make (array_length * 2) (-1L) in
-      Array.blit !data_refs 0 arr 0 array_length ;
-      data_refs := arr
+    let array_length = Qcow_mapping.length data_refs in
+    if Cluster.to_int64 !max_cluster > array_length then (
+      Printf.fprintf stderr "resizing from %Lu\n" array_length ;
+      Qcow_mapping.extend data_refs (array_length ** 2L)
     )
   in
 
@@ -299,8 +300,8 @@ let stream_make_cluster_map h size_sectors cluster_info metadata () =
       ( if cluster <> Cluster.zero then
           let virt_address = Virtual.{l1_index; l2_index; cluster= 0L} in
           let virt_address = Virtual.to_offset ~cluster_bits virt_address in
-          let index = Cluster.to_int cluster in
-          !data_refs.(index) <- virt_address
+          let index = Cluster.to_int64 cluster in
+          Qcow_mapping.set data_refs index virt_address
       ) ;
       data_iter l1_index l2 l2_table_cluster (i + 1)
   in
@@ -354,10 +355,11 @@ let stream_make_cluster_map h size_sectors cluster_info metadata () =
       l1_iter (Int64.succ i)
   in
   l1_iter 0L >>= fun () ->
-  Printf.fprintf stderr "data_refs cardinal: %d\n" (Array.length !data_refs) ;
+  Printf.fprintf stderr "data_refs cardinal: %Lu\n"
+    (Qcow_mapping.length data_refs) ;
   Printf.fprintf stderr "data_refs reachable: %d\n"
-    (Obj.reachable_words (Obj.repr !data_refs)) ;
-  Lwt.return (Ok !data_refs)
+    (Obj.reachable_words (Obj.repr data_refs)) ;
+  Lwt.return (Ok data_refs)
 
 let stream_make last_read_cluster fd h sector_size =
   (* The virtual disk has 512 byte sectors *)
@@ -438,9 +440,13 @@ let copy_data ~progress_cb last_read_cluster cluster_bits input_fd output_fd
       complete_read_bytes
   in
 
-  let max_cluster = Array.length data_cluster_map in
+  let max_cluster = Int64.to_int (Qcow_mapping.length data_cluster_map) in
   let cur_percent = ref 0 in
-  let thread (cluster, file_offset) =
+  (* TODO: avoid lwt_ppx, do some to_seq stuff instead ? *)
+  for%lwt cluster = 0 to max_cluster - 1 do
+    let file_offset =
+      Qcow_mapping.get data_cluster_map (Int64.of_int cluster)
+    in
     if file_offset >= 0L then (
       (* Copy the entire cluster *)
       Log.debug (fun f ->
@@ -459,10 +465,7 @@ let copy_data ~progress_cb last_read_cluster cluster_bits input_fd output_fd
           failwith "I/O error"
     ) else
       Lwt.return ()
-  in
-  let seq = Array.to_seqi data_cluster_map in
-  let seq = Lwt_seq.of_seq seq in
-  Lwt_seq.iter_s thread seq
+  done
 
 let stream_decode ?(progress_cb = fun _x -> ()) ?header_info input_fd
     output_path =
