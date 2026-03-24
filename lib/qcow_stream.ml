@@ -139,7 +139,8 @@ exception Compressed_unsupported
 (* Reads and parses refcount, L1, L2 tables.
    See the note above on the structure of the QCOW file we expect.
 *)
-let stream_make_cluster_map h size_sectors cluster_info metadata () =
+let stream_make_cluster_map h size_sectors cluster_info metadata
+    parent_cluster_map physical_size () =
   let open Lwt_error.Infix in
   let open Lwt.Syntax in
   let cluster_bits, sectors_per_cluster =
@@ -147,69 +148,91 @@ let stream_make_cluster_map h size_sectors cluster_info metadata () =
     | {i_cluster_bits; i_sectors_per_cluster} ->
         (i_cluster_bits, i_sectors_per_cluster)
   in
-
-  let refcount_start_cluster =
-    Cluster.to_int64
-    @@ Physical.cluster ~cluster_bits h.Header.refcount_table_offset
-  in
   let int64s_per_cluster = 1L <| cluster_bits - 3 in
-  let l1_table_start_cluster =
-    Cluster.to_int64 @@ Physical.cluster ~cluster_bits h.Header.l1_table_offset
-  in
   let l1_table_clusters =
     Int64.(round_up (of_int32 h.Header.l1_size) int64s_per_cluster)
     // int64s_per_cluster
   in
-
-  (* As opposed to make_cluster_map, where size_sectors comes from known
-     physical file size, when streaming we do not yet know the full size of
-     the file. We instead calculate it as virtual_size + l1 table clusters +
-     l2 table clusters + refcount table clusters as we go, and hence
-     max_cluster will change accordingly *)
-  let max_cluster =
-    ref (Cluster.of_int64 (size_sectors // sectors_per_cluster))
+  let refcount_start_cluster =
+    Cluster.to_int64
+    @@ Physical.cluster ~cluster_bits h.Header.refcount_table_offset
   in
-  let refcount_table_clusters =
-    Int64.of_int32 h.Header.refcount_table_clusters
+  let l1_table_start_cluster =
+    Cluster.to_int64 @@ Physical.cluster ~cluster_bits h.Header.l1_table_offset
   in
-  max_cluster :=
-    Cluster.add !max_cluster
-      (Cluster.of_int64 (Int64.of_int32 h.Header.refcount_table_clusters)) ;
-  (* There can be a gap between refcount table clusters and L1 clusters for
-     some reason, count that against max_cluster as well *)
-  let gap =
-    l1_table_start_cluster -- (refcount_start_cluster ++ refcount_table_clusters)
+  let max_cluster = ref Cluster.zero in
+
+  (* If physical size is known, then the bitmap for allocated clusters has a
+     predetermined size.
+
+     If we have a bitmap for a parent backing file, use it as a base and
+     extend if needed (this will preserve allocated clusters, add empty
+     clusters at the end if needed)
+
+     If physical size is not known (when streaming), we instead estimate it
+     as virtual_size + l1 table clusters + l2 table clusters + refcount table clusters
+     as we go, and hence max_cluster will change accordingly *)
+  let data_refs, physical_size_known =
+    match physical_size with
+    | Some physical_size ->
+        let physical_clusters = Int64.of_int (physical_size lsr cluster_bits) in
+        let data_refs =
+          match parent_cluster_map with
+          | Some parent_map ->
+              let parent_length = Qcow_mapping.length parent_map in
+              if physical_clusters > parent_length then
+                Qcow_mapping.extend parent_map physical_clusters ;
+              parent_map
+          | None ->
+              Qcow_mapping.create physical_clusters
+        in
+        max_cluster := Cluster.of_int64 physical_clusters ;
+        (data_refs, true)
+    | None ->
+        max_cluster := Cluster.of_int64 (size_sectors // sectors_per_cluster) ;
+        let refcount_table_clusters =
+          Int64.of_int32 h.Header.refcount_table_clusters
+        in
+        max_cluster :=
+          Cluster.add !max_cluster
+            (Cluster.of_int64 (Int64.of_int32 h.Header.refcount_table_clusters)) ;
+        (* There can be a gap between refcount table clusters and L1 clusters
+           for some reason, count that against max_cluster as well *)
+        let gap =
+          l1_table_start_cluster
+          -- (refcount_start_cluster ++ refcount_table_clusters)
+        in
+        max_cluster := Cluster.add !max_cluster (Cluster.of_int64 gap) ;
+
+        Log.debug (fun f ->
+            f
+              "refcount_table_clusters is %d\n\
+              \ max_cluster is %Lu (virtual size + refcount + gap between \
+               refcount and L1 table, to be adjusted)\n\
+              \ sectors_per_cluster is %Lu\n"
+              (Int32.to_int h.Header.refcount_table_clusters)
+              (Cluster.to_int64 !max_cluster)
+              sectors_per_cluster
+        ) ;
+        (* Construct a mapping of physical clusters to virtual offsets
+
+           Since we don't know which offset data clusters start from, we need to
+           allocate an array covering all of the (estimated) physical clusters and
+           potentially resize it during processing.
+
+           All clusters are initialized with -1 to distinguish physical clusters
+           which are not data clusters.
+
+           For physical cluster Y, its virtual address is at index Y in the array.
+           *)
+        let x = Cluster.to_int64 !max_cluster in
+        (* Necessary physical size is <1.000125 of virtual size of the image,
+           given that a single L2 cluster (of default 65536 size) can point to
+           8192 data clusters. Larger cluster sizes reduce the necessary physical
+           size even further. *)
+        let physical_clusters_approx = x ++ (x // 8000L) in
+        (Qcow_mapping.create physical_clusters_approx, false)
   in
-  max_cluster := Cluster.add !max_cluster (Cluster.of_int64 gap) ;
-
-  Log.debug (fun f ->
-      f
-        "refcount_table_clusters is %d\n\
-        \ max_cluster is %Lu (virtual size + refcount + gap between refcount \
-         and L1 table, to be adjusted)\n\
-        \ sectors_per_cluster is %Lu\n"
-        (Int32.to_int h.Header.refcount_table_clusters)
-        (Cluster.to_int64 !max_cluster)
-        sectors_per_cluster
-  ) ;
-  (* Construct a mapping of physical clusters to virtual offsets
-
-     Since we don't know which offset data clusters start from, we need to
-     allocate an array covering all of the (estimated) physical clusters and
-     potentially resize it during processing.
-
-     All clusters are initialized with -1 to distinguish physical clusters
-     which are not data clusters.
-
-     For physical cluster Y, its virtual address is at index Y in the array.
-     *)
-  let x = Cluster.to_int64 !max_cluster in
-  (* Necessary physical size is <1.000125 of virtual size of the image,
-     given that a single L2 cluster (of default 65536 size) can point to
-     8192 data clusters. Larger cluster sizes reduce the necessary physical
-     size even further. *)
-  let physical_clusters_approx = x ++ (x // 8000L) in
-  let data_refs = Qcow_mapping.create physical_clusters_approx in
 
   let parse x =
     if x = Physical.unmapped then
@@ -248,9 +271,9 @@ let stream_make_cluster_map h size_sectors cluster_info metadata () =
     ) ;
     if cluster = Cluster.zero then
       ()
-    else if is_table then (
-      (* See note above, we need to account for table clusters when streaming
-         since we don't know the physical size of the file *)
+    else if is_table && not physical_size_known then (
+      (* See note above, we need to account for table clusters only
+         when streaming since we don't know the physical size of the file *)
       (max_cluster := Cluster.(add !max_cluster (of_int64 1L))
       ) ;
 
@@ -366,7 +389,8 @@ let stream_make_cluster_map h size_sectors cluster_info metadata () =
   in
   l1_iter 0L >>= fun () -> Lwt.return (Ok data_refs)
 
-let stream_make last_read_cluster fd h sector_size =
+let stream_make last_read_cluster fd h sector_size parent_cluster_map
+    physical_size =
   (* The virtual disk has 512 byte sectors *)
   let size_sectors = h.Header.size // 512L in
   let cluster_bits = Int32.to_int h.Header.cluster_bits in
@@ -388,9 +412,10 @@ let stream_make last_read_cluster fd h sector_size =
     {i_cluster_bits= cluster_bits; i_sectors_per_cluster= sectors_per_cluster}
   in
   Lwt_error.or_fail_with
-  @@ stream_make_cluster_map h size_sectors cluster_info metadata ()
+  @@ stream_make_cluster_map h size_sectors cluster_info metadata
+       parent_cluster_map physical_size ()
 
-let start_stream_decode fd =
+let rec internal_start_stream_decode fd =
   let open Lwt.Syntax in
   (* Read a single sector from the beginning of the stream *)
   let sector_size = 512 in
@@ -411,24 +436,102 @@ let start_stream_decode fd =
       let cluster_size = 1 lsl cluster_bits in
       let npages = 1 lsl (cluster_bits - 12) in
       Log.debug (fun f -> f "pages_left_to_read is %d\n" npages) ;
-      ( if npages > 0 then
+
+      let* st = Lwt_unix.fstat fd in
+      (* Read the backing file name if there is one *)
+      let* backing_file_name =
+        if npages > 0 then
           let pages = Io_page.(to_cstruct (get npages)) in
           (* We've already read a single 512-byte sector *)
           let buf = Cstruct.sub pages 0 (cluster_size - 512) in
-          Lwt.ignore_result (stream_read fd buf)
-      ) ;
+
+          let* remaining = stream_read fd buf in
+          if header.Header.backing_file_offset <> 0L then
+            if st.st_kind = S_REG then
+              let name =
+                Cstruct.to_string remaining
+                  ~off:(Int64.to_int header.Header.backing_file_offset - 512)
+                  ~len:(Int32.to_int header.Header.backing_file_size)
+              in
+              Lwt.return (Some name)
+            else
+              raise
+                (Invalid_argument
+                   "Backing files not supported for streamed QCOW2 images"
+                )
+          else
+            Lwt.return None
+        else
+          Lwt.return None
+      in
+
+      (* Recursively open all the backing files until there aren't any
+         anymore, overlay their data cluster tables on top of one another *)
+      let* parent_data_cluster_map, parent_physical_size =
+        match backing_file_name with
+        | Some file_name ->
+            let* fd = Lwt_unix.openfile file_name [Unix.O_RDONLY] 0 in
+            let* ( _
+                 , parent_l1_size
+                 , parent_cluster_bits
+                 , _
+                 , parent_data_cluster_map
+                 , parent_physical_size ) =
+              internal_start_stream_decode fd
+            in
+            if header.cluster_bits <> parent_cluster_bits then
+              let msg =
+                Printf.sprintf
+                  "Backing file's cluster_bits differ from the image (%ld vs. \
+                   %ld)"
+                  header.cluster_bits parent_cluster_bits
+              in
+              raise (Invalid_argument msg)
+            else if header.l1_size <> parent_l1_size then
+              let msg =
+                Printf.sprintf
+                  "Backing file's L1 table size differs from the image (%ld \
+                   vs. %ld)"
+                  header.l1_size parent_l1_size
+              in
+              raise (Invalid_argument msg)
+            else
+              Lwt.return (Some parent_data_cluster_map, parent_physical_size)
+        | None ->
+            Lwt.return (None, None)
+      in
+      let physical_size =
+        match st.st_kind with S_REG -> Some st.st_size | _ -> None
+      in
+      let max_physical_size =
+        match parent_physical_size with
+        | Some x ->
+            Some (max x (Option.get physical_size))
+        | None ->
+            physical_size
+      in
 
       (* Parse all the tables to get a full map of data clusters *)
       let last_read_cluster = ref 0L in
       let* data_cluster_map =
         stream_make last_read_cluster fd header sector_size
+          parent_data_cluster_map max_physical_size
       in
       Lwt.return
         ( header.Header.size
+        , header.Header.l1_size
         , header.cluster_bits
         , last_read_cluster
         , data_cluster_map
+        , max_physical_size
         )
+
+let start_stream_decode fd =
+  let open Lwt.Syntax in
+  let* size, _l1_size, cluster_bits, last_read_cluster, data_cluster_map, _ =
+    internal_start_stream_decode fd
+  in
+  Lwt.return (size, cluster_bits, last_read_cluster, data_cluster_map)
 
 let copy_data ~progress_cb last_read_cluster cluster_bits input_fd output_fd
     data_cluster_map =
