@@ -10,6 +10,15 @@ val start_stream_decode :
     Returns (virtual_size, cluster_bits, last_read_cluster, data_cluster_map)
    *)
 
+val read_chain_headers :
+  string -> (int64 * int32 * int64 ref * Qcow_mapping.t) Lwt.t
+(** [read_chain_headers path] Decodes QCOW header and tables of the whole
+    "snapshot" chain of QCOW2 images (with each one referring to its parent, if
+    present, in the backing file name field), constructing a map of data
+    clusters.
+    Returns (virtual_size, cluster_bits, last_read_cluster, data_cluster_map)
+   *)
+
 val copy_data :
      progress_cb:(int -> unit)
   -> int64 ref
