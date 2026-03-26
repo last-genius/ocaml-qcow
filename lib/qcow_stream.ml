@@ -57,28 +57,43 @@ let read_complete op t =
   let* bytes_read = loop t 0 in
   return (Cstruct.sub t 0 bytes_read)
 
-let stream_read fd buf = read_complete (Lwt_cstruct.read fd) buf
+let stream_read fd buf _cluster_offset = read_complete (Lwt_cstruct.read fd) buf
 
-let complete_pwrite_bytes fd buf file_offset =
-  let pwrite fd buf ~file_offset ~buf_offset ~len =
-    Lwt_unix.pwrite fd buf ~file_offset buf_offset len
+let complete_pos_op op fd buf file_offset =
+  let op_fn fd buf ~file_offset ~buf_offset ~len =
+    op fd buf ~file_offset buf_offset len
   in
   let open Lwt.Syntax in
   let open Lwt in
   let rec loop buf file_offset buf_offset len =
-    let* wrote_bytes_nr = pwrite fd buf ~file_offset ~buf_offset ~len in
-    Log.debug (fun f -> f "wrote %d bytes, len left %d\n" wrote_bytes_nr len) ;
-    if wrote_bytes_nr = len then
-      return ()
-    else if wrote_bytes_nr = 0 then
-      fail End_of_file
+    let* done_bytes_nr = op_fn fd buf ~file_offset ~buf_offset ~len in
+    if done_bytes_nr = len || done_bytes_nr = 0 then
+      return done_bytes_nr
     else
-      loop buf
-        (file_offset + wrote_bytes_nr)
-        (buf_offset + wrote_bytes_nr)
-        (len - wrote_bytes_nr)
+      let* x =
+        loop buf
+          (file_offset + done_bytes_nr)
+          (buf_offset + done_bytes_nr)
+          (len - done_bytes_nr)
+      in
+      return (x + done_bytes_nr)
   in
-  loop buf file_offset 0 (Bytes.length buf)
+  let* bytes_read = loop buf file_offset 0 (Bytes.length buf) in
+  return (Bytes.sub buf 0 bytes_read)
+
+let complete_pwrite_bytes fd buf file_offset =
+  let open Lwt.Syntax in
+  let* _ = complete_pos_op Lwt_unix.pwrite fd buf file_offset in
+  Lwt.return ()
+
+let complete_pread_bytes fd buf file_offset =
+  let open Lwt.Syntax in
+  let bytes = Bytes.create (Cstruct.length buf) in
+  let* bytes =
+    complete_pos_op Lwt_unix.pread fd bytes (Int64.to_int file_offset)
+  in
+  Cstruct.blit_from_bytes bytes 0 buf 0 (Bytes.length bytes) ;
+  Lwt.return buf
 
 let malloc_bytes cluster_bits =
   let cluster_bits = Int32.to_int cluster_bits in
@@ -108,15 +123,19 @@ let malloc cluster_bits =
    consume QCOW2 files that are not ordered as above, the logic would need to
    be more dynamic.
 *)
-let read_cluster last_read_cluster fd cluster_bits alloc_func read_func i =
+let read_cluster seekable last_read_cluster fd cluster_bits alloc_func read_func
+    i =
   let cluster = Cluster.to_int64 i in
-  if !last_read_cluster ++ 1L = cluster then (
+  if !last_read_cluster ++ 1L = cluster || seekable then (
     last_read_cluster := cluster ;
     let buf = alloc_func cluster_bits in
-    Log.debug (fun f -> f "\tread_cluster %Lu\n" cluster) ;
+    let cluster_offset = Int64.shift_left cluster (Int32.to_int cluster_bits) in
     let open Lwt.Infix in
     Lwt.catch
-      (fun () -> read_func fd buf >>= fun read_buf -> Lwt.return (Ok read_buf))
+      (fun () ->
+        read_func fd buf cluster_offset >>= fun read_buf ->
+        Lwt.return (Ok read_buf)
+      )
       (fun e ->
         Log.err (fun f ->
             f "read_cluster %Ld: low-level I/O exception %s" cluster
@@ -412,11 +431,19 @@ let stream_make last_read_cluster fd h sector_size parent_cluster_map
   ) ;
 
   let locks = Locks.make () in
+  let read_func =
+    match physical_size with
+    | Some _ ->
+        complete_pread_bytes
+    | None ->
+        stream_read
+  in
+  let seekable = Option.is_some physical_size in
   let read_cluster =
-    read_cluster last_read_cluster fd h.cluster_bits malloc stream_read
+    read_cluster seekable last_read_cluster fd h.cluster_bits malloc read_func
   in
   let write_cluster _i _buf = assert false in
-  let cache = Cache.create ~read_cluster ~write_cluster ~seekable:false () in
+  let cache = Cache.create ~read_cluster ~write_cluster ~seekable () in
   let metadata = Metadata.make ~cache ~cluster_bits ~locks () in
   let cluster_info =
     {i_cluster_bits= cluster_bits; i_sectors_per_cluster= sectors_per_cluster}
@@ -430,7 +457,7 @@ let rec internal_start_stream_decode fd base_dir =
   (* Read a single sector from the beginning of the stream *)
   let sector_size = 512 in
   let buf = Cstruct.sub Io_page.(to_cstruct (get 1)) 0 sector_size in
-  let* buf = stream_read fd buf in
+  let* buf = stream_read fd buf () in
   (* Parse the header *)
   match Qcow_header.read buf with
   | Error (`Msg msg) ->
@@ -455,7 +482,7 @@ let rec internal_start_stream_decode fd base_dir =
           (* We've already read a single 512-byte sector *)
           let buf = Cstruct.sub pages 0 (cluster_size - 512) in
 
-          let* remaining = stream_read fd buf in
+          let* remaining = stream_read fd buf () in
           if header.Header.backing_file_offset <> 0L then
             match (base_dir, st.st_kind) with
             | Some dir, S_REG ->
@@ -555,14 +582,14 @@ let copy_data ~progress_cb last_read_cluster cluster_bits input_fd output_fd
     data_cluster_map =
   let open Lwt.Syntax in
   let input_channel = Lwt_io.of_fd ~mode:Lwt_io.input input_fd in
-  let complete_read_bytes ic buf =
+  let complete_read_bytes ic buf _ =
     let* () = Lwt_io.read_into_exactly ic buf 0 (Bytes.length buf) in
     Lwt.return buf
   in
   let buf = malloc_bytes cluster_bits in
   let get_buf _ = buf in
   let read_cluster_bytes =
-    read_cluster last_read_cluster input_channel cluster_bits get_buf
+    read_cluster false last_read_cluster input_channel cluster_bits get_buf
       complete_read_bytes
   in
 
