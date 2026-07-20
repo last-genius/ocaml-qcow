@@ -451,6 +451,7 @@ let copy_data ~progress_cb last_read_cluster cluster_bits input_fd output_fd
   in
 
   let max_cluster = Int64.to_int (Qcow_mapping.length data_cluster_map) in
+  let filled_clusters = Int64.to_int (Qcow_mapping.filled data_cluster_map) in
   let cur_percent = ref 0 in
 
   for%lwt cluster = 0 to max_cluster - 1 do
@@ -463,7 +464,7 @@ let copy_data ~progress_cb last_read_cluster cluster_bits input_fd output_fd
       Log.debug (fun f ->
           f "copy cluster: %d, file_offset : %Lu\n" cluster file_offset
       ) ;
-      let now_percent = cluster / (max_cluster * 100) in
+      let now_percent = (cluster * 100) / filled_clusters in
       if now_percent > !cur_percent then (
         cur_percent := now_percent ;
         progress_cb now_percent
